@@ -1,0 +1,14 @@
+# Build artifacts
+dist/
+prompt-sudo-discord
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.idea/
+.vscode/
+
+# Config
+config.json

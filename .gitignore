@@ -1,0 +1,21 @@
+# Binaries
+prompt-sudo-discord
+*.exe
+
+# Build artifacts
+dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Config (sensitive)
+config.json
+*.pem
+*.key
