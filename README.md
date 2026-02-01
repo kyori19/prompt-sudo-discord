@@ -73,11 +73,13 @@ Only users listed in `approver_ids` config can approve/deny.
 
 ```json
 {
-  "discord_token": "YOUR_BOT_TOKEN_HERE",
+  "discord_token": "Bot YOUR_BOT_TOKEN_HERE",
   "approver_ids": ["YOUR_DISCORD_USER_ID"],
   "timeout_seconds": 300
 }
 ```
+
+Note: `discord_token` must be prefixed with `Bot ` (including the space).
 
 ## License
 
