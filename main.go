@@ -20,10 +20,10 @@ var configPath = "/etc/prompt-sudo-discord/config.json"
 
 const defaultTimeout = 300
 
-// Reaction emojis for approval/denial
-var (
-	approveEmojis = []string{"✅", "👍", "☑️", "🆗"}
-	denyEmojis    = []string{"❌", "👎", "🚫", "⛔"}
+// Button custom IDs
+const (
+	buttonApproveID = "psd_approve"
+	buttonDenyID    = "psd_deny"
 )
 
 type Config struct {
@@ -69,15 +69,6 @@ func loadConfig(path string) (*Config, error) {
 func isApprover(userID string, approverIDs []string) bool {
 	for _, id := range approverIDs {
 		if id == userID {
-			return true
-		}
-	}
-	return false
-}
-
-func containsEmoji(emoji string, list []string) bool {
-	for _, e := range list {
-		if e == emoji {
 			return true
 		}
 	}
@@ -134,33 +125,56 @@ func main() {
 		os.Exit(1)
 	}
 	
-	// We need to receive reaction events
-	dg.Identify.Intents = discordgo.IntentsGuildMessageReactions | discordgo.IntentsDirectMessageReactions
+	// No specific intents needed; interactions arrive via the gateway regardless
 	
 	// Channel for approval result
 	resultCh := make(chan ApprovalResult, 1)
 	var requestMsgID string
 	
-	// Reaction handler
-	dg.AddHandler(func(s *discordgo.Session, r *discordgo.MessageReactionAdd) {
-		// Only process reactions on our request message
-		if r.MessageID != requestMsgID {
+	// Interaction handler (button clicks)
+	dg.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
+		if i.Type != discordgo.InteractionMessageComponent {
 			return
 		}
-		
+
+		// Only process interactions on our request message
+		if i.Message == nil || i.Message.ID != requestMsgID {
+			return
+		}
+
 		// Check if user is an approver
-		if !isApprover(r.UserID, config.ApproverIDs) {
+		userID := ""
+		if i.Member != nil {
+			userID = i.Member.User.ID
+		} else if i.User != nil {
+			userID = i.User.ID
+		}
+		if !isApprover(userID, config.ApproverIDs) {
+			s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+				Type: discordgo.InteractionResponseChannelMessageWithSource,
+				Data: &discordgo.InteractionResponseData{
+					Content: "⚠️ You are not an authorized approver.",
+					Flags:   discordgo.MessageFlagsEphemeral,
+				},
+			})
 			return
 		}
-		
-		// Check the emoji
-		emoji := r.Emoji.Name
-		if containsEmoji(emoji, approveEmojis) {
+
+		customID := i.MessageComponentData().CustomID
+
+		switch customID {
+		case buttonApproveID:
+			s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+				Type: discordgo.InteractionResponseDeferredMessageUpdate,
+			})
 			select {
 			case resultCh <- ApprovalApproved:
 			default:
 			}
-		} else if containsEmoji(emoji, denyEmojis) {
+		case buttonDenyID:
+			s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+				Type: discordgo.InteractionResponseDeferredMessageUpdate,
+			})
 			select {
 			case resultCh <- ApprovalDenied:
 			default:
@@ -184,20 +198,44 @@ func main() {
 		"```\n%s\n```\n"+
 		"**Host:** `%s`\n"+
 		"**CWD:** `%s`\n"+
-		"**Timeout:** %ds\n\n"+
-		"React with ✅ to approve or ❌ to deny.",
+		"**Timeout:** %ds",
 		commandStr, hostname, cwd, timeoutSec)
-	
-	// Send the request message
-	var msg *discordgo.Message
+
+	msgSend := &discordgo.MessageSend{
+		Content: requestContent,
+		Components: []discordgo.MessageComponent{
+			discordgo.ActionsRow{
+				Components: []discordgo.MessageComponent{
+					discordgo.Button{
+						Label:    "Approve",
+						Style:    discordgo.SuccessButton,
+						CustomID: buttonApproveID,
+						Emoji: &discordgo.ComponentEmoji{
+							Name: "✅",
+						},
+					},
+					discordgo.Button{
+						Label:    "Deny",
+						Style:    discordgo.DangerButton,
+						CustomID: buttonDenyID,
+						Emoji: &discordgo.ComponentEmoji{
+							Name: "❌",
+						},
+					},
+				},
+			},
+		},
+	}
 	if *replyTo != "" {
-		msg, err = dg.ChannelMessageSendReply(*channelID, requestContent, &discordgo.MessageReference{
+		msgSend.Reference = &discordgo.MessageReference{
 			MessageID: *replyTo,
 			ChannelID: *channelID,
-		})
-	} else {
-		msg, err = dg.ChannelMessageSend(*channelID, requestContent)
+		}
 	}
+
+	// Send the request message
+	var msg *discordgo.Message
+	msg, err = dg.ChannelMessageSendComplex(*channelID, msgSend)
 	
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error sending Discord message: %v\n", err)
@@ -225,46 +263,62 @@ func main() {
 		result = ApprovalTimeout
 	case <-sigCh:
 		fmt.Fprintln(os.Stderr, "\nInterrupted")
-		// Update Discord message
-		dg.ChannelMessageSend(*channelID, fmt.Sprintf("⚠️ Request `%s` was **cancelled** (interrupted).", requestMsgID))
+		// Update Discord message - remove buttons and show cancelled status
+		cancelContent := requestContent + "\n\n⚠️ **Cancelled** (interrupted)."
+		dg.ChannelMessageEditComplex(&discordgo.MessageEdit{
+			ID:         requestMsgID,
+			Channel:    *channelID,
+			Content:    &cancelContent,
+			Components: &[]discordgo.MessageComponent{},
+		})
 		os.Exit(130)
 	}
 	
+	// disableButtons edits the original message to remove buttons and append a status line
+	disableButtons := func(status string) {
+		editContent := requestContent + "\n\n" + status
+		dg.ChannelMessageEditComplex(&discordgo.MessageEdit{
+			ID:         requestMsgID,
+			Channel:    *channelID,
+			Content:    &editContent,
+			Components: &[]discordgo.MessageComponent{},
+		})
+	}
+
 	// Handle result
 	switch result {
 	case ApprovalApproved:
 		fmt.Fprintln(os.Stderr, "✅ Approved! Executing command...")
-		
-		// Update Discord
-		dg.ChannelMessageSend(*channelID, fmt.Sprintf("✅ Request `%s` **approved**. Executing...", requestMsgID))
-		
+
+		disableButtons("✅ **Approved.** Executing...")
+
 		// Close Discord connection before exec
 		dg.Close()
-		
+
 		// Find the executable path
 		execPath, err := exec.LookPath(commandArgs[0])
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error finding executable: %v\n", err)
 			os.Exit(1)
 		}
-		
+
 		// Replace current process with the command
 		err = syscall.Exec(execPath, commandArgs, os.Environ())
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error executing command: %v\n", err)
 			os.Exit(1)
 		}
-		
+
 	case ApprovalDenied:
 		fmt.Fprintln(os.Stderr, "❌ Denied.")
-		dg.ChannelMessageSend(*channelID, fmt.Sprintf("❌ Request `%s` **denied**.", requestMsgID))
+		disableButtons("❌ **Denied.**")
 		os.Exit(1)
-		
+
 	case ApprovalTimeout:
 		fmt.Fprintln(os.Stderr, "⏰ Timeout.")
-		dg.ChannelMessageSend(*channelID, fmt.Sprintf("⏰ Request `%s` **timed out** after %ds.", requestMsgID, timeoutSec))
+		disableButtons(fmt.Sprintf("⏰ **Timed out** after %ds.", timeoutSec))
 		os.Exit(1)
-		
+
 	default:
 		fmt.Fprintln(os.Stderr, "Unknown error")
 		os.Exit(1)

@@ -61,11 +61,13 @@ sudo /usr/local/bin/prompt-sudo-discord \
 
 ## Approval
 
-React to the approval request message with:
-- ✅ 👍 ☑️ 🆗 - Approve (execute the command)
-- ❌ 👎 🚫 ⛔ - Deny (reject the request)
+Use the buttons on the approval request message:
+- ✅ **Approve** - execute the command
+- ❌ **Deny** - reject the request
 
-Only users listed in `approver_ids` config can approve/deny.
+Only users listed in `approver_ids` can approve/deny.
+Unauthorized clicks are ignored and shown an ephemeral warning.
+After approval/deny/timeout, buttons are removed and the request message is updated with the final status.
 
 ## Config
 
