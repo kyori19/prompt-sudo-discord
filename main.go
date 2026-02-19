@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -85,10 +87,11 @@ func main() {
 	channelID := flag.String("channel", "", "Discord channel ID to post approval request")
 	replyTo := flag.String("reply-to", "", "Message ID to reply to (optional)")
 	timeout := flag.Int("timeout", 0, "Timeout in seconds (default: from config or 300)")
+	showStdin := flag.Bool("show-stdin", false, "Read stdin and include it in the approval request")
 	// Config path is hardcoded - cannot be overridden by arguments for security
-	
+
 	flag.Parse()
-	
+
 	// Get command to execute (everything after --)
 	commandArgs := flag.Args()
 	if len(commandArgs) == 0 {
@@ -96,41 +99,52 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Usage: prompt-sudo-discord --channel CHANNEL_ID [--reply-to MSG_ID] -- COMMAND [ARGS...]")
 		os.Exit(1)
 	}
-	
+
 	if *channelID == "" {
 		fmt.Fprintln(os.Stderr, "Error: --channel is required")
 		os.Exit(1)
 	}
-	
+
+	// Read stdin if --show-stdin is enabled
+	var stdinData []byte
+	if *showStdin {
+		var err error
+		stdinData, err = io.ReadAll(os.Stdin)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error reading stdin: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
 	// Load config (path is set at build time)
 	config, err := loadConfig(configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error loading config: %v\n", err)
 		os.Exit(1)
 	}
-	
+
 	// Use timeout from flag, config, or default
 	timeoutSec := config.TimeoutSeconds
 	if *timeout > 0 {
 		timeoutSec = *timeout
 	}
-	
+
 	// Format command for display
 	commandStr := formatCommand(commandArgs)
-	
+
 	// Create Discord session
 	dg, err := discordgo.New(config.DiscordToken)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error creating Discord session: %v\n", err)
 		os.Exit(1)
 	}
-	
+
 	// No specific intents needed; interactions arrive via the gateway regardless
-	
+
 	// Channel for approval result
 	resultCh := make(chan ApprovalResult, 1)
 	var requestMsgID string
-	
+
 	// Interaction handler (button clicks)
 	dg.AddHandler(func(s *discordgo.Session, i *discordgo.InteractionCreate) {
 		if i.Type != discordgo.InteractionMessageComponent {
@@ -181,7 +195,7 @@ func main() {
 			}
 		}
 	})
-	
+
 	// Open websocket connection
 	err = dg.Open()
 	if err != nil {
@@ -189,17 +203,30 @@ func main() {
 		os.Exit(1)
 	}
 	defer dg.Close()
-	
+
 	// Build the request message
 	hostname, _ := os.Hostname()
 	cwd, _ := os.Getwd()
-	
+
 	requestContent := fmt.Sprintf("**🔐 Sudo Request**\n"+
 		"```\n%s\n```\n"+
 		"**Host:** `%s`\n"+
 		"**CWD:** `%s`\n"+
 		"**Timeout:** %ds",
 		commandStr, hostname, cwd, timeoutSec)
+
+	if *showStdin {
+		stdinDisplay := string(stdinData)
+		// Discord message limit is 2000 chars; reserve space for the rest of the message
+		maxStdinDisplay := 2000 - len(requestContent) - len("\n**Stdin:**\n```\n\n```") - 50
+		if maxStdinDisplay < 0 {
+			maxStdinDisplay = 0
+		}
+		if len(stdinDisplay) > maxStdinDisplay {
+			stdinDisplay = stdinDisplay[:maxStdinDisplay] + fmt.Sprintf("\n... (%d bytes truncated)", len(stdinDisplay)-maxStdinDisplay)
+		}
+		requestContent += fmt.Sprintf("\n**Stdin:**\n```\n%s\n```", stdinDisplay)
+	}
 
 	msgSend := &discordgo.MessageSend{
 		Content: requestContent,
@@ -236,24 +263,24 @@ func main() {
 	// Send the request message
 	var msg *discordgo.Message
 	msg, err = dg.ChannelMessageSendComplex(*channelID, msgSend)
-	
+
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error sending Discord message: %v\n", err)
 		os.Exit(1)
 	}
 	requestMsgID = msg.ID
-	
+
 	fmt.Fprintf(os.Stderr, "Approval request sent (message ID: %s)\n", requestMsgID)
 	fmt.Fprintf(os.Stderr, "Waiting for approval (timeout: %ds)...\n", timeoutSec)
-	
+
 	// Setup context with timeout
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec)*time.Second)
 	defer cancel()
-	
+
 	// Handle interrupt
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-	
+
 	// Wait for result
 	var result ApprovalResult
 	select {
@@ -273,7 +300,7 @@ func main() {
 		})
 		os.Exit(130)
 	}
-	
+
 	// disableButtons edits the original message to remove buttons and append a status line
 	disableButtons := func(status string) {
 		editContent := requestContent + "\n\n" + status
@@ -295,18 +322,32 @@ func main() {
 		// Close Discord connection before exec
 		dg.Close()
 
-		// Find the executable path
-		execPath, err := exec.LookPath(commandArgs[0])
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error finding executable: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Replace current process with the command
-		err = syscall.Exec(execPath, commandArgs, os.Environ())
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error executing command: %v\n", err)
-			os.Exit(1)
+		if *showStdin {
+			// Use os/exec to pipe buffered stdin to the command
+			cmd := exec.Command(commandArgs[0], commandArgs[1:]...)
+			cmd.Stdin = bytes.NewReader(stdinData)
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			err := cmd.Run()
+			if err != nil {
+				if exitErr, ok := err.(*exec.ExitError); ok {
+					os.Exit(exitErr.ExitCode())
+				}
+				fmt.Fprintf(os.Stderr, "Error executing command: %v\n", err)
+				os.Exit(1)
+			}
+		} else {
+			// Replace current process with the command
+			execPath, err := exec.LookPath(commandArgs[0])
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error finding executable: %v\n", err)
+				os.Exit(1)
+			}
+			err = syscall.Exec(execPath, commandArgs, os.Environ())
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error executing command: %v\n", err)
+				os.Exit(1)
+			}
 		}
 
 	case ApprovalDenied:
